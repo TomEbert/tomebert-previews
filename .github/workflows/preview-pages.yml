@@ -1,0 +1,74 @@
+name: Sync temporary previews
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '3-58/5 * * * *'
+permissions: {}
+concurrency:
+  group: preview-pages
+  cancel-in-progress: false
+jobs:
+  package:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - name: Package open same-repository PRs
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: TomEbert/tomebert-website
+        run: |
+          set -euo pipefail
+          mkdir public
+          gh api --paginate "repos/$SOURCE/pulls?state=open&base=main&per_page=100" \
+            --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | [.number, .head.sha] | @tsv' | sort -n > open.tsv
+          printf '%s\n' "$GITHUB_SHA" > public/snapshot.txt
+          cat open.tsv >> public/snapshot.txt
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]] &&
+             curl -fsS --max-time 15 https://tomebert.github.io/tomebert-previews/snapshot.txt -o previous.txt 2>/dev/null &&
+             cmp -s previous.txt public/snapshot.txt; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git init -q source
+          git -C source remote add origin "https://github.com/$SOURCE.git"
+          printf '%s\n' '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="robots" content="noindex"><title>Temporary PR previews</title><h1>Temporary PR previews</h1><ul>' > public/index.html
+          while IFS=$'\t' read -r number sha; do
+            [[ "$number" =~ ^[0-9]+$ && "$sha" =~ ^[a-f0-9]{40}$ ]] || exit 1
+            git -C source fetch --quiet --no-tags --depth=1 origin "$sha"
+            git -C source cat-file -e "$sha:site/index.html" || continue
+            if git -C source ls-tree -r "$sha:site" | awk '$1 == "120000" || $1 == "160000" { found=1 } END { exit !found }'; then
+              echo "::warning::Skipped preview $number because it contains a symlink or submodule"
+              continue
+            fi
+            folder="public/pr-$number"
+            mkdir "$folder"
+            git -C source archive "$sha:site" | tar -x -C "$folder"
+            printf '<li><a href="pr-%s/">PR #%s</a></li>\n' "$number" "$number" >> public/index.html
+          done < open.tsv
+          printf '%s\n' '</ul></html>' >> public/index.html
+          printf '%s\n' 'User-agent: *' 'Disallow:' > public/robots.txt
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        if: steps.sync.outputs.changed == 'true'
+        with:
+          path: public
+  deploy:
+    needs: package
+    if: needs.package.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        id: pages
